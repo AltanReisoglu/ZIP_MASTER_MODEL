@@ -1,12 +1,14 @@
 """
-ZIP Game Training with TRL GRPO + Unsloth
+ZIP Game Training with TRL GRPO
 
-Based on TRL OpenEnv examples (wordle.py, sudoku.py) and Unsloth GRPO patterns.
+Based on TRL OpenEnv examples (wordle.py, sudoku.py) - no vLLM dependency.
+Uses standard model.generate() for rollouts.
 """
 
 from __future__ import annotations
 
 import argparse
+import random
 import re
 from collections import defaultdict
 from datetime import datetime
@@ -15,47 +17,52 @@ from typing import Any
 
 import torch
 from datasets import Dataset
-from trl.experimental.openenv import generate_rollout_completions
-# Local imports
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from trl import GRPOConfig, GRPOTrainer
+
+
 from zip_env import ZipEnv, ZipAction, ZipObservation, ZipResult
-
-
-# ============== SYSTEM PROMPT ==============
 
 SYSTEM_PROMPT = """Sen ZIP oyunu oynayan bir AI'sın.
 
 ## Oyun Kuralları:
-1. 6x6 board üzerinde 1'den 10'a kadar numaralar var
+1. Board üzerinde 1'den N'e kadar numaralar var
 2. 1 numarasından başlayıp sırayla tüm numaralara ulaşmalısın
 3. Her adımda sadece up, down, left, right hareket yapabilirsin
 4. Bir hücre sadece bir kez ziyaret edilebilir
 5. Tüm numaralara sırayla ulaş
 
-## Cevap Formatı:
-Sadece şu formatı kullan: [action]
-Örnek: [up], [down], [left], [right]
+## ZORUNLU Cevap Formatı:
+ÖNCE düşün, SONRA cevap ver!
 
-Düşün ve en iyi hareketi seç."""
+<think>
+- Şu anki pozisyonum nerede?
+- Hedef numara nerede?
+- Hangi yönler legal?
+- En iyi hareket hangisi?
+</think>
+<answer>up</answer>
+
+Sadece up, down, left, right kullan!
+"""
 
 
 # ============== PARSING ==============
 
 def extract_action(text: str) -> str:
     """Extract action [up/down/left/right] from text."""
-    # Try [action] format first
+    
+    match = re.search(r'<answer>(up|down|left|right)</answer>', text.lower())
+    if match:
+        return match.group(1)
+    
+    
     match = re.search(r'\[(up|down|left|right)\]', text.lower())
     if match:
         return match.group(1)
     
-    # Try ACTION: format
-    if "action:" in text.lower():
-        parts = text.lower().split("action:")
-        if len(parts) > 1:
-            action = parts[1].strip().split()[0].strip(".,!?[]")
-            if action in ["up", "down", "left", "right"]:
-                return action
     
-    # Try direct keyword
     for action in ["up", "down", "left", "right"]:
         if action in text.lower():
             return action
@@ -70,7 +77,7 @@ def make_prompt(obs: ZipObservation, move_history: list[str] = None) -> str:
     
     history_text = ""
     if move_history and len(move_history) > 0:
-        recent = move_history[-5:]  # Show last 5 moves only
+        recent = move_history[-5:]  
         history_text = f"\n\nSon hareketler: {', '.join(recent)}"
     
     return f"""{SYSTEM_PROMPT}
@@ -83,56 +90,202 @@ def make_prompt(obs: ZipObservation, move_history: list[str] = None) -> str:
 Bir sonraki hareketi seç:"""
 
 
-# ============== REWARD FUNCTIONS ==============
 
-def reward_valid_move(completions: list[str], **kwargs) -> list[float]:
-    """Reward for making valid moves."""
-    rewards = kwargs.get("valid_move_reward")
-    if rewards is None:
-        return [0.0 for _ in completions]
-    return [float(r) for r in rewards]
-
-
-def reward_target_reached(completions: list[str], **kwargs) -> list[float]:
-    """Reward for reaching the target number."""
-    rewards = kwargs.get("target_reward")
-    if rewards is None:
-        return [0.0 for _ in completions]
-    return [float(r) for r in rewards]
+def reward_valid_action(completions: list[str], **kwargs) -> list[float]:
+    """Reward for extracting a valid action from completion."""
+    rewards = []
+    for c in completions:
+        action = extract_action(c)
+        if action in ["up", "down", "left", "right"]:
+            rewards.append(1.0)
+        else:
+            rewards.append(-1.0)
+    return rewards
 
 
-def reward_progress(completions: list[str], **kwargs) -> list[float]:
-    """Reward for overall progress in the game."""
-    rewards = kwargs.get("progress_reward")
-    if rewards is None:
-        return [0.0 for _ in completions]
-    return [float(r) for r in rewards]
+def reward_format(completions: list[str], **kwargs) -> list[float]:
+    """Reward for proper <answer> format."""
+    rewards = []
+    for c in completions:
+        if "<answer>" in c.lower() and "</answer>" in c.lower():
+            rewards.append(1.0)
+        elif "<answer>" in c.lower():
+            rewards.append(0.5)
+        else:
+            rewards.append(-1.0)
+    return rewards
 
 
-def reward_win(completions: list[str], **kwargs) -> list[float]:
-    """Reward for winning the game."""
-    rewards = kwargs.get("win_reward")
-    if rewards is None:
-        return [0.0 for _ in completions]
-    return [float(r) for r in rewards]
+def reward_thinking(completions: list[str], **kwargs) -> list[float]:
+    """Strong reward for quality thinking in <think> tags."""
+    import re
+    rewards = []
+    for c in completions:
+        c_lower = c.lower()
+        
+        # Check for think tags
+        if "<think>" in c_lower and "</think>" in c_lower:
+            match = re.search(r'<think>(.*?)</think>', c_lower, re.DOTALL)
+            if match:
+                content = match.group(1).strip()
+                
+                # Score based on quality indicators
+                score = 0.5  # Base for having think tags
+                
+                # Bonus for mentioning directions
+                if any(d in content for d in ['up', 'down', 'left', 'right']):
+                    score += 0.5
+                
+                # Bonus for mentioning position or target
+                if any(w in content for w in ['pozisyon', 'hedef', 'target', 'numara']):
+                    score += 0.5
+                
+                # Bonus for reasoning words
+                if any(w in content for w in ['çünkü', 'because', 'ise', 'olmalı', 'gitmeli']):
+                    score += 0.5
+                
+                # Length bonus (but not too long)
+                if 20 < len(content) < 200:
+                    score += 0.5
+                
+                rewards.append(min(score, 2.0))  # Cap at 2.0
+            else:
+                rewards.append(0.0)
+        else:
+            rewards.append(-1.0)  # Penalty for no thinking
+    return rewards
 
 
-def reward_repetition(completions: list[str], **kwargs) -> list[float]:
-    """Penalty for repeating moves."""
-    rewards = kwargs.get("repetition_reward")
-    if rewards is None:
-        return [0.0 for _ in completions]
-    return [float(r) for r in rewards]
+def reward_conciseness(completions: list[str], **kwargs) -> list[float]:
+    """Reward for concise responses (not hitting max length)."""
+    rewards = []
+    for c in completions:
+        length = len(c)
+        if length < 200:
+            rewards.append(1.0)  # Very concise
+        elif length < 400:
+            rewards.append(0.5)  # Reasonable
+        else:
+            rewards.append(-0.5)  # Too long (likely hit max tokens)
+    return rewards
 
 
-# ============== ROLLOUT FUNCTION ==============
+def reward_coverage(completions: list[str], prompts: list[str] = None, **kwargs) -> list[float]:
+    """
+    Reward for visiting more cells on the board.
+    Higher reward for higher coverage.
+    """
+    rewards = []
+    for c in completions:
+        # Count visited cells mentioned in completion
+        # For now, give reward based on valid action (more moves = more coverage)
+        action = extract_action(c)
+        if action in ["up", "down", "left", "right"]:
+            rewards.append(0.5)  # Each valid move contributes to coverage
+        else:
+            rewards.append(-0.5)
+    return rewards
+
+
+
+
+def generate_solvable_dataset(env: ZipEnv, size: int = 100, save_path: str = None) -> Dataset:
+    """
+    Generate training dataset from solvable ZIP boards.
+    Each entry contains a prompt (board state) and optional solution.
+    """
+    prompts = []
+    solutions = []
+    
+    print(f"Generating {size} random boards...")
+    
+    for i in range(size):
+        result = env.reset()  # Random board (fast!)
+        obs = result.observation
+        prompt = make_prompt(obs)
+        
+        prompts.append(prompt)
+        solutions.append("")  # No pre-computed solution
+        
+        if (i + 1) % 100 == 0:
+            print(f"  Generated {i + 1}/{size} boards")
+    
+    dataset = Dataset.from_dict({
+        "prompt": prompts,
+        "solution": solutions,
+    })
+    
+    
+    if save_path:
+        dataset.save_to_disk(save_path)
+        print(f"Dataset saved to: {save_path}")
+    
+    print(f"Dataset created: {len(dataset)} solvable boards")
+    return dataset
+
+
+
+
+def generate_completion(model, tokenizer, prompt_text: str, max_new_tokens: int = 128, temperature: float = 0.7) -> dict:
+    """
+    Generate completion using standard HuggingFace model.generate().
+    Returns dict with prompt_ids, completion_ids, logprobs, text.
+    """
+    device = next(model.parameters()).device
+    
+    
+    inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True, max_length=2048)
+    input_ids = inputs["input_ids"].to(device)
+    attention_mask = inputs["attention_mask"].to(device)
+    prompt_ids = input_ids[0].tolist()
+    
+    
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=True,
+            pad_token_id=tokenizer.pad_token_id,
+            return_dict_in_generate=True,
+            output_scores=True,
+        )
+    
+    
+    generated_ids = outputs.sequences[0]
+    completion_ids = generated_ids[len(prompt_ids):].tolist()
+    
+    
+    logprobs = []
+    if outputs.scores:
+        for i, score in enumerate(outputs.scores):
+            if i < len(completion_ids):
+                token_id = completion_ids[i]
+                log_softmax = torch.log_softmax(score[0], dim=-1)
+                logprobs.append(log_softmax[token_id].item())
+    
+
+    text = tokenizer.decode(completion_ids, skip_special_tokens=True)
+    
+    return {
+        "prompt_ids": prompt_ids,
+        "completion_ids": completion_ids,
+        "logprobs": logprobs,
+        "text": text,
+    }
+
+
+
 
 def rollout_once(
-    trainer,
-    env: ZipEnv,
+    model,
     tokenizer,
+    env: ZipEnv,
     system_prompt: str,
     max_turns: int = 50,
+    max_new_tokens: int = 512,
+    temperature: float = 0.7,
     debug: bool = False,
 ) -> dict[str, Any]:
     """
@@ -140,19 +293,20 @@ def rollout_once(
     Returns data for the LAST turn only (for efficient backprop).
     """
     
-    
     result = env.reset()
     observation = result.observation
     
-    # Store only last turn for backprop (efficient!)
+    
     last_turn_data: dict | None = None
     
-    # Track rewards
+    
     valid_move_scores: list[float] = []
     target_scores: list[float] = []
     progress_scores: list[float] = []
     win_scores: list[float] = []
     repetition_scores: list[float] = []
+    format_scores: list[float] = []
+    think_scores: list[float] = []
     
     move_counts: defaultdict[str, int] = defaultdict(int)
     move_history: list[str] = []
@@ -165,7 +319,7 @@ def rollout_once(
         if result.done:
             break
         
-        # Build prompt
+        
         user_prompt = make_prompt(observation, move_history)
         messages = [
             {"role": "system", "content": system_prompt},
@@ -183,21 +337,23 @@ def rollout_once(
             print(f"{'='*60}")
             print(f"PROMPT:\n{user_prompt[:500]}...")
         
-        # Generate completion
-        rollout_outputs = generate_rollout_completions(trainer, [prompt_text])[0]
         
-        # Store only this turn's data (replace previous)
+        rollout_outputs = generate_completion(
+            model, tokenizer, prompt_text,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature
+        )
+        
+        
         last_turn_data = {
             "prompt_ids": rollout_outputs["prompt_ids"],
             "completion_ids": rollout_outputs["completion_ids"],
             "logprobs": rollout_outputs["logprobs"],
         }
         
-        completion_text = rollout_outputs.get("text") or tokenizer.decode(
-            rollout_outputs["completion_ids"], skip_special_tokens=True
-        )
+        completion_text = rollout_outputs["text"]
         
-        # Extract action
+        
         action_str = extract_action(completion_text)
         
         if debug:
@@ -207,39 +363,48 @@ def rollout_once(
         # Calculate repetition penalty BEFORE move
         previous_occurrences = move_counts[action_str]
         move_counts[action_str] += 1
+
+        if "<answer>" in completion_text:
+            format_scores.append(1.0)
+        else:
+            format_scores.append(-1.0)
+
+        if "<think>" in completion_text.lower() and "</think>" in completion_text.lower():
+            think_scores.append(1.0)
+        else:
+            think_scores.append(-1.0)
         
         if previous_occurrences > 0:
-            # Exponential penalty: -2^(n-1) capped at -5
+            
             repetition_score = -min(2 ** (previous_occurrences - 1), 5.0)
         else:
             repetition_score = 0.0
         
-        # Step environment
+        
         if action_str and action_str in observation.legal_actions:
             action = ZipAction(action_str)
             result = env.step(action)
             move_history.append(action_str)
             
-            # Valid move reward
+            
             valid_score = 1.0
             
-            # Check if target was reached
+            
             new_obs = result.observation
             if new_obs.current_target > observation.current_target:
-                target_score = 2.0  # Bonus for reaching target
+                target_score = 2.0  
                 max_target_reached = new_obs.current_target
             else:
                 target_score = 0.0
             
             observation = new_obs
         else:
-            # Invalid move - penalty
+            
             valid_score = -1.0
             target_score = 0.0
             
-            # Try random legal action as fallback
+            
             if observation.legal_actions:
-                import random
                 fallback = random.choice(observation.legal_actions)
                 action = ZipAction(fallback)
                 result = env.step(action)
@@ -268,6 +433,9 @@ def rollout_once(
     target_reward = sum(target_scores) / max(len(target_scores), 1)
     win_reward = win_scores[-1] if win_scores else 0.0
     repetition_reward = sum(repetition_scores) / max(len(repetition_scores), 1)
+    format_reward = sum(format_scores) / max(len(format_scores), 1)
+    think_reward = sum(think_scores) / max(len(think_scores), 1)
+    
     
     # Progress reward: how many targets we reached
     total_targets = env.num_count
@@ -299,6 +467,8 @@ def rollout_once(
         "progress_reward": progress_reward,
         "win_reward": win_reward,
         "repetition_reward": repetition_reward,
+        "format_reward": format_reward,
+        "think_reward": think_reward,
     }
 
 
@@ -308,7 +478,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ZIP Game GRPO Training")
     
     # Model
-    parser.add_argument("--model-id", default="unsloth/Ministral-3B-Instruct-2503")
+    parser.add_argument("--model-id", default="Qwen/Qwen2.5-0.5B-Instruct")
     
     # Environment
     parser.add_argument("--board-size", type=int, default=6)
@@ -316,15 +486,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-turns", type=int, default=50)
     
     # Training
-    parser.add_argument("--dataset-size", type=int, default=1000)
+    parser.add_argument("--dataset-size", type=int, default=100)
     parser.add_argument("--learning-rate", type=float, default=5e-6)
     parser.add_argument("--num-generations", type=int, default=4)
-    parser.add_argument("--per-device-batch-size", type=int, default=1)
+    parser.add_argument("--per-device-batch-size", type=int, default=2)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=16)
     parser.add_argument("--num-epochs", type=int, default=1)
-    parser.add_argument("--max-new-tokens", type=int, default=32)
+    parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--lora-rank", type=int, default=32)
+    
+    # Quantization
+    parser.add_argument("--use-4bit", action="store_true", default=False)
     
     # Checkpoints
     parser.add_argument("--save-interval", type=int, default=50)
@@ -341,44 +514,57 @@ def main() -> None:
     args = parse_args()
     
     print("=" * 60)
-    print("ZIP Game Training with TRL GRPO + Unsloth")
+    print("ZIP Game Training with TRL GRPO")
     print("=" * 60)
     
-    # Setup Unsloth model
+    # Setup model
     print(f"\n[1/4] Loading model: {args.model_id}")
     
-    from unsloth import FastLanguageModel
+    if args.use_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+    else:
+        bnb_config = None
     
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=args.model_id,
-        max_seq_length=2048,
-        load_in_4bit=True,
-        fast_inference=True,  # Enable vLLM-like fast inference
+    # Load model
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_id,
+        quantization_config=bnb_config,
+        device_map="auto",
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
     )
     
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=args.lora_rank,
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
-        lora_alpha=args.lora_rank * 2,
-        use_gradient_checkpointing="unsloth",
-        random_state=3407,
-    )
-    
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    
+    # Prepare for training with LoRA
+    if args.use_4bit:
+        model = prepare_model_for_kbit_training(model)
+    
+    lora_config = LoraConfig(
+        r=args.lora_rank,
+        lora_alpha=args.lora_rank * 2,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_dropout=0.0,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
     
     # Setup environment
     print("\n[2/4] Creating environment")
     env = ZipEnv(size=args.board_size, num_count=args.num_count)
     
-    # Create dataset
-    dataset = Dataset.from_dict({
-        "prompt": ["Play the ZIP game."] * args.dataset_size
-    })
+    # Create solvable dataset
+    print("\n[2.5/4] Generating solvable dataset")
+    dataset = generate_solvable_dataset(env, size=args.dataset_size)
     
     # Setup output directory
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -387,8 +573,6 @@ def main() -> None:
     
     # GRPO Config
     print("\n[3/4] Setting up GRPO trainer")
-    
-    from trl import GRPOConfig, GRPOTrainer
     
     grpo_config = GRPOConfig(
         output_dir=str(output_dir),
@@ -402,12 +586,10 @@ def main() -> None:
         logging_steps=args.logging_steps,
         save_strategy="steps",
         save_steps=args.save_interval,
-        # vLLM settings for Unsloth
-        use_vllm=True,
-        vllm_mode="colocate",
+        report_to="none",  # Disable WandB
     )
     
-    # Define rollout function
+    # Define rollout function for GRPO
     def rollout_func(prompts: list[str], trainer: GRPOTrainer) -> dict[str, list]:
         all_prompt_ids = []
         all_completion_ids = []
@@ -417,14 +599,18 @@ def main() -> None:
         all_progress = []
         all_win = []
         all_repetition = []
+        all_format = []
+        all_think = []
         
         for _ in prompts:
             episode = rollout_once(
-                trainer=trainer,
-                env=env,
+                model=model,
                 tokenizer=tokenizer,
+                env=env,
                 system_prompt=SYSTEM_PROMPT,
                 max_turns=args.max_turns,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
                 debug=args.debug,
             )
             
@@ -436,6 +622,8 @@ def main() -> None:
             all_progress.append(episode["progress_reward"])
             all_win.append(episode["win_reward"])
             all_repetition.append(episode["repetition_reward"])
+            all_format.append(episode["format_reward"])
+            all_think.append(episode["think_reward"])
         
         return {
             "prompt_ids": all_prompt_ids,
@@ -446,6 +634,7 @@ def main() -> None:
             "progress_reward": all_progress,
             "win_reward": all_win,
             "repetition_reward": all_repetition,
+            "format_reward": all_format,
         }
     
     # Create trainer
@@ -453,11 +642,11 @@ def main() -> None:
         model=model,
         processing_class=tokenizer,
         reward_funcs=[
-            reward_valid_move,     # Learn to make valid moves
-            reward_target_reached, # Learn to reach targets
-            reward_progress,       # Learn to fill more of the board
-            reward_win,            # Learn to complete the game
-            reward_repetition,     # Avoid repeating moves
+            reward_valid_action,  # Extract valid action
+            reward_format,        # Proper <answer> format
+            reward_thinking,      # Use <think> tags
+            reward_conciseness,   # Don't hit max tokens
+            reward_coverage,      # Visit all cells
         ],
         train_dataset=dataset,
         args=grpo_config,
@@ -467,6 +656,7 @@ def main() -> None:
     # Train
     print("\n[4/4] Starting training")
     print("-" * 60)
+    print(f"Model: {args.model_id}")
     print(f"Generations per prompt: {args.num_generations}")
     print(f"Max turns per episode: {args.max_turns}")
     print(f"Output directory: {output_dir}")
@@ -480,6 +670,7 @@ def main() -> None:
     # Save final model
     final_path = output_dir / "final"
     trainer.save_model(str(final_path))
+    tokenizer.save_pretrained(str(final_path))
     print(f"\nTraining completed! Model saved to: {final_path}")
 
 
