@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ZIP Game AI - Interactive Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <span class="logo-icon">🎮</span>
+                <span class="logo-text">ZIP Game AI</span>
+            </div>
+            <div class="header-actions">
+                <button id="loadModelBtn" class="btn btn-primary">
+                    <span class="btn-icon">🤖</span>
+                    Model Yükle
+                </button>
+                <div class="model-status" id="modelStatus">
+                    <span class="status-dot offline"></span>
+                    <span class="status-text">Model Yüklenmedi</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Left Panel: Game Board -->
+            <section class="game-panel">
+                <div class="panel-header">
+                    <h2>Oyun Tahtası</h2>
+                    <div class="game-info">
+                        <span class="info-badge" id="targetBadge">Hedef: 2</span>
+                        <span class="info-badge" id="coverageBadge">Kapsam: 0%</span>
+                    </div>
+                </div>
+                
+                <div class="board-container">
+                    <div class="game-board" id="gameBoard">
+                        <!-- Board will be rendered here -->
+                        <div class="board-placeholder">
+                            <span>🎯</span>
+                            <p>Yeni oyun başlatmak için <br>"Yeni Oyun" butonuna tıklayın</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Game Controls -->
+                <div class="game-controls">
+                    <div class="control-group">
+                        <button id="newGameBtn" class="btn btn-success">
+                            <span class="btn-icon">🆕</span>
+                            Yeni Oyun
+                        </button>
+                        <button id="aiMoveBtn" class="btn btn-primary" disabled>
+                            <span class="btn-icon">🧠</span>
+                            AI Hamle
+                        </button>
+                        <button id="autoPlayBtn" class="btn btn-secondary" disabled>
+                            <span class="btn-icon">▶️</span>
+                            Otomatik Oyna
+                        </button>
+                    </div>
+                    
+                    <div class="arrow-controls">
+                        <button class="arrow-btn" data-direction="up" disabled>↑</button>
+                        <div class="arrow-row">
+                            <button class="arrow-btn" data-direction="left" disabled>←</button>
+                            <button class="arrow-btn" data-direction="down" disabled>↓</button>
+                            <button class="arrow-btn" data-direction="right" disabled>→</button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Right Panel: Stats & History -->
+            <aside class="stats-panel">
+                <!-- Statistics -->
+                <div class="stats-card">
+                    <h3>📊 İstatistikler</h3>
+                    <div class="stats-grid">
+                        <div class="stat-item">
+                            <span class="stat-value" id="totalGames">0</span>
+                            <span class="stat-label">Toplam Oyun</span>
+                        </div>
+                        <div class="stat-item highlight">
+                            <span class="stat-value" id="winRate">0%</span>
+                            <span class="stat-label">Kazanma Oranı</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-value" id="validMoves">0</span>
+                            <span class="stat-label">Geçerli Hamle</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-value" id="illegalMoves">0</span>
+                            <span class="stat-label">Geçersiz Hamle</span>
+                        </div>
+                        <div class="stat-item highlight">
+                            <span class="stat-value" id="optimalRate">0%</span>
+                            <span class="stat-label">Optimal Oran</span>
+                        </div>
+                    </div>
+                    <button id="resetStatsBtn" class="btn btn-ghost btn-small">
+                        🔄 İstatistikleri Sıfırla
+                    </button>
+                </div>
+
+                <!-- Move History -->
+                <div class="history-card">
+                    <h3>📜 Hamle Geçmişi</h3>
+                    <div class="history-list" id="historyList">
+                        <div class="history-empty">
+                            <span>Henüz hamle yapılmadı</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Settings -->
+                <div class="settings-card">
+                    <h3>⚙️ Ayarlar</h3>
+                    <div class="setting-group">
+                        <label>Tahta Boyutu</label>
+                        <select id="boardSize">
+                            <option value="4">4x4</option>
+                            <option value="5">5x5</option>
+                            <option value="6" selected>6x6</option>
+                            <option value="7">7x7</option>
+                        </select>
+                    </div>
+                    <div class="setting-group">
+                        <label>Sayı Adedi</label>
+                        <select id="numCount">
+                            <option value="4">4</option>
+                            <option value="6">6</option>
+                            <option value="8" selected>8</option>
+                            <option value="10">10</option>
+                        </select>
+                    </div>
+                    <div class="setting-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="solvableMode" checked>
+                            Çözülebilir Tahta
+                        </label>
+                    </div>
+                    <div class="setting-group">
+                        <label>Otomatik Oyun Hızı</label>
+                        <input type="range" id="autoPlaySpeed" min="100" max="2000" value="500" step="100">
+                        <span id="speedLabel">500ms</span>
+                    </div>
+                </div>
+            </aside>
+        </main>
+
+        <!-- Game Result Modal -->
+        <div class="modal" id="resultModal">
+            <div class="modal-content">
+                <div class="modal-icon" id="resultIcon">🏆</div>
+                <h2 id="resultTitle">Oyun Bitti!</h2>
+                <p id="resultMessage">Tebrikler! Oyunu kazandınız.</p>
+                <div class="modal-stats" id="modalStats"></div>
+                <button class="btn btn-primary" onclick="closeModal()">Tamam</button>
+            </div>
+        </div>
+
+        <!-- Loading Overlay -->
+        <div class="loading-overlay" id="loadingOverlay">
+            <div class="loading-spinner"></div>
+            <p id="loadingText">Model yükleniyor...</p>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
