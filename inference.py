@@ -54,7 +54,7 @@ def generate_response(model, tokenizer, prompt: str, max_new_tokens: int = 64) -
         outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            temperature=0.7,
+            temperature=0.1,
             do_sample=True,
             pad_token_id=tokenizer.pad_token_id,
         )
@@ -176,12 +176,4 @@ def main():
         total_illegal += illegal
         print(f"Game {i+1}: {'Won' if won else 'Lost'} | Valid: {valid}, Illegal: {illegal}")
     
-    print("\n" + "-" * 60)
-    print(f"Win rate: {wins}/{args.num_games} ({wins/args.num_games*100:.1f}%)")
-    print(f"Avg valid moves: {total_valid/args.num_games:.1f}")
-    print(f"Avg illegal moves: {total_illegal/args.num_games:.1f}")
-    print("-" * 60)
-
-
-if __name__ == "__main__":
-    main()
+    print(f"\nWin rate: {wins}/10 ({wins*10}%)")
