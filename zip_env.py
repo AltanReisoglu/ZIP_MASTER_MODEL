@@ -227,10 +227,66 @@ class ZipEnv:
             info_state=info_state,
         )
     
+    def _generate_snake_path(self) -> list[tuple[int, int]]:
+        """
+        Generate a guaranteed Hamiltonian path using snake pattern.
+        This is O(n²) and always succeeds - no backtracking needed!
+        
+        Pattern: zigzag through rows
+        Row 0: left to right
+        Row 1: right to left
+        Row 2: left to right
+        ...
+        """
+        path = []
+        for r in range(self.size):
+            if r % 2 == 0:
+                # Left to right
+                for c in range(self.size):
+                    path.append((r, c))
+            else:
+                # Right to left
+                for c in range(self.size - 1, -1, -1):
+                    path.append((r, c))
+        return path
+    
+    def _generate_spiral_path(self) -> list[tuple[int, int]]:
+        """
+        Generate Hamiltonian path using spiral pattern.
+        Alternative to snake for variety.
+        """
+        path = []
+        top, bottom, left, right = 0, self.size - 1, 0, self.size - 1
+        
+        while top <= bottom and left <= right:
+            # Right
+            for c in range(left, right + 1):
+                path.append((top, c))
+            top += 1
+            
+            # Down
+            for r in range(top, bottom + 1):
+                path.append((r, right))
+            right -= 1
+            
+            # Left
+            if top <= bottom:
+                for c in range(right, left - 1, -1):
+                    path.append((bottom, c))
+                bottom -= 1
+            
+            # Up
+            if left <= right:
+                for r in range(bottom, top - 1, -1):
+                    path.append((r, left))
+                left += 1
+        
+        return path
+    
     def _generate_solvable_path(self, length: int) -> list[tuple[int, int]] | None:
         """
         Generate a Hamiltonian path that visits ALL cells.
-        Uses Warnsdorff's heuristic: prefer moves to cells with fewer remaining neighbors.
+        Uses FAST snake/spiral patterns instead of slow backtracking.
         """
         total_cells = self.size * self.size
         
@@ -238,18 +294,22 @@ class ZipEnv:
         if length < total_cells:
             return self._generate_partial_path(length)
         
-        max_attempts = 50
+        # Choose pattern randomly for variety
+        if self.rng.random() < 0.5:
+            base_path = self._generate_snake_path()
+        else:
+            base_path = self._generate_spiral_path()
         
-        for _ in range(max_attempts):
-            # Try different starting positions
-            start_r = self.rng.randint(0, self.size)
-            start_c = self.rng.randint(0, self.size)
-            
-            path = self._try_hamiltonian_from(start_r, start_c)
-            if path and len(path) == total_cells:
-                return path
+        # Optionally rotate/flip the path for more variety
+        if self.rng.random() < 0.25:
+            # Reverse the path
+            base_path = base_path[::-1]
         
-        return None
+        if self.rng.random() < 0.25:
+            # Rotate 90 degrees: (r, c) -> (c, size-1-r)
+            base_path = [(c, self.size - 1 - r) for r, c in base_path]
+        
+        return base_path
     
     def _count_unvisited_neighbors(self, r: int, c: int, visited: set) -> int:
         """Count how many unvisited neighbors a cell has."""

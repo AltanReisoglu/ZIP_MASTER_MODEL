@@ -164,91 +164,60 @@ def get_direction_toward_target(current_pos: tuple, target_pos: tuple) -> list[s
 
 def generate_strategic_dataset(env: ZipEnv, size: int = 500) -> Dataset:
     """
-    Generate training dataset with STRATEGIC moves from expert play.
-    
-    This creates (prompt, optimal_action) pairs where optimal_action
-    is the move that leads toward winning.
+    Generate training dataset with STRATEGIC moves from guaranteed solvable games.
     """
     prompts = []
+    print(f"Generating {size} STRATEGIC game states from SOLVABLE boards...")
     
-    print(f"Generating {size} STRATEGIC game states...")
-    
-    generated = 0
-    attempts = 0
-    max_attempts = size * 5
-    
-    while generated < size and attempts < max_attempts:
-        attempts += 1
-        
-        # Reset with random board
-        result = env.reset()
+    while len(prompts) < size:
+        # reset_solvable returns (result, solution_list_of_moves)
+        result, solution = env.reset_solvable()
         obs = result.observation
         
-        # Play some random moves to get varied positions
-        for _ in range(random.randint(0, 20)):
-            if result.done or not obs.legal_actions:
+        if not solution:
+            continue
+            
+        # Walk through the solution to generate samples
+        for move_str in solution:
+            if len(prompts) >= size:
                 break
-            action = ZipAction(random.choice(obs.legal_actions))
-            result = env.step(action)
-            obs = result.observation
-        
-        if result.done or not obs.legal_actions:
-            continue
-        
-        # Find optimal move: prioritize moves toward target
-        current_pos = obs.current_pos
-        target_num = obs.current_target
-        target_pos = None
-        
-        # Find target position from number_pos
-        if target_num in env.number_pos:
-            target_pos = env.number_pos[target_num]
-        
-        optimal_action = None
-        toward_target = None
-        
-        if target_pos:
-            # Get directions toward target
-            good_dirs = get_direction_toward_target(current_pos, target_pos)
+                
+            # Build prompt for CURRENT state
+            board_text = obs.to_text()
+            legal = ", ".join(obs.legal_actions)
             
-            # Filter by legal actions
-            good_legal = [d for d in good_dirs if d in obs.legal_actions]
-            
-            if good_legal:
-                optimal_action = random.choice(good_legal)
-                toward_target = optimal_action
-        
-        # If no strategic move, pick any legal move
-        if not optimal_action and obs.legal_actions:
-            optimal_action = random.choice(obs.legal_actions)
-        
-        if not optimal_action:
-            continue
-        
-        # Build enhanced prompt with hints
-        board_text = obs.to_text()
-        legal = ", ".join(obs.legal_actions)
-        
-        # Add metadata for reward functions (hidden from model display)
-        prompt = f"""{SYSTEM_PROMPT}
+            # Add metadata for reward functions
+            # We treat the solver's move as THE optimal move
+            prompt = f"""{SYSTEM_PROMPT}
 
 ## Board:
 {board_text}
 
 ## Available Moves: [{legal}]
-## OPTIMAL: {optimal_action}"""
-        
-        if toward_target:
-            prompt += f"\n## TOWARD_TARGET: {toward_target}"
-        
-        prompt += "\n\nYour move:"
-        
-        prompts.append(prompt)
-        generated += 1
-        
-        if generated % 100 == 0:
-            print(f"  {generated}/{size}")
-    
+## OPTIMAL: {move_str}"""
+
+            # Add TOWARD_TARGET if applicable (for legacy reward support)
+            # We can calculate if the move is toward the target
+            target_num = obs.current_target
+            if target_num in env.number_pos:
+                target_pos = env.number_pos[target_num]
+                # specific logic to recreate get_direction_toward_target here or just skip
+                # Let's just trust OPTIMAL for now.
+            
+            prompt += "\n\nYour move:"
+            prompts.append(prompt)
+            
+            # Execute step
+            action = ZipAction(move_str)
+            result = env.step(action)
+            obs = result.observation
+            
+            if result.done:
+                break
+
+        if len(prompts) % 100 == 0:
+             print(f"  {len(prompts)}/{size}")
+             
     print(f"Dataset: {len(prompts)} strategic samples")
     return Dataset.from_dict({"prompt": prompts})
 
@@ -260,7 +229,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id", default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--board-size", type=int, default=6)
     parser.add_argument("--num-count", type=int, default=8)
-    parser.add_argument("--dataset-size", type=int, default=500)
+    parser.add_argument("--dataset-size", type=int, default=2000)
     parser.add_argument("--learning-rate", type=float, default=5e-6)
     parser.add_argument("--num-generations", type=int, default=4)
     parser.add_argument("--per-device-batch-size", type=int, default=2)
@@ -341,6 +310,8 @@ def main() -> None:
         save_strategy="steps",
         save_steps=args.save_interval,
         report_to="none",
+        bf16=False,
+        fp16=torch.cuda.is_available(),
     )
     
     # Create trainer with strategic rewards
