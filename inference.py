@@ -4,6 +4,9 @@ ZIP Game Inference - Test trained model
 
 from __future__ import annotations
 
+import argparse
+import random
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
@@ -16,7 +19,6 @@ def load_trained_model(model_path: str, base_model_id: str = "Qwen/Qwen2.5-0.5B-
     """Load the trained LoRA model."""
     print(f"Loading base model: {base_model_id}")
     
-    # Load base model
     base_model = AutoModelForCausalLM.from_pretrained(
         base_model_id,
         device_map="auto",
@@ -24,12 +26,10 @@ def load_trained_model(model_path: str, base_model_id: str = "Qwen/Qwen2.5-0.5B-
         torch_dtype=torch.float16,
     )
     
-    # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(base_model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # Load LoRA weights
     print(f"Loading LoRA weights from: {model_path}")
     model = PeftModel.from_pretrained(base_model, model_path)
     model.eval()
@@ -37,12 +37,9 @@ def load_trained_model(model_path: str, base_model_id: str = "Qwen/Qwen2.5-0.5B-
     return model, tokenizer
 
 
-def generate_response(model, tokenizer, prompt: str, max_new_tokens: int = 256) -> str:
+def generate_response(model, tokenizer, prompt: str, max_new_tokens: int = 64) -> str:
     """Generate a response from the model."""
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": prompt},
-    ]
+    messages = [{"role": "user", "content": prompt}]
     
     prompt_text = tokenizer.apply_chat_template(
         messages,
@@ -62,34 +59,35 @@ def generate_response(model, tokenizer, prompt: str, max_new_tokens: int = 256) 
             pad_token_id=tokenizer.pad_token_id,
         )
     
-    # Decode only the generated part
     generated_ids = outputs[0][len(inputs["input_ids"][0]):]
     response = tokenizer.decode(generated_ids, skip_special_tokens=True)
     
     return response
 
 
-def play_game(model, tokenizer, env: ZipEnv, max_turns: int = 20, verbose: bool = True):
+def play_game(model, tokenizer, env: ZipEnv, max_turns: int = 30, verbose: bool = True):
     """Play a complete game using the trained model."""
-    result, solution = env.reset_solvable()
+    # Use fast random board
+    result = env.reset()
     obs = result.observation
     
     if verbose:
         print("=" * 60)
         print("ZIP GAME - AI Player")
         print("=" * 60)
-        print(f"\nKnown solution: {solution}")
         print(f"\nInitial board:")
         print(obs.to_text())
     
     move_history = []
+    valid_moves = 0
+    illegal_moves = 0
     
     for turn in range(max_turns):
-        if result.done:
+        if result.done or not obs.legal_actions:
             break
         
-        # Generate prompt
-        prompt = make_prompt(obs, move_history)
+        # Generate prompt (matches zip_train.py format)
+        prompt = make_prompt(obs)
         
         # Get model response
         response = generate_response(model, tokenizer, prompt)
@@ -99,9 +97,8 @@ def play_game(model, tokenizer, env: ZipEnv, max_turns: int = 20, verbose: bool 
         
         if verbose:
             print(f"\n--- Turn {turn + 1} ---")
-            print(f"Model response:\n{response[:500]}")
-            print(f"\nExtracted action: {action_str}")
-            print(f"Legal actions: {obs.legal_actions}")
+            print(f"Model: {response[:100]}...")
+            print(f"Action: {action_str} | Legal: {obs.legal_actions}")
         
         # Execute action
         if action_str and action_str in obs.legal_actions:
@@ -109,57 +106,82 @@ def play_game(model, tokenizer, env: ZipEnv, max_turns: int = 20, verbose: bool 
             result = env.step(action)
             move_history.append(action_str)
             obs = result.observation
+            valid_moves += 1
             
             if verbose:
-                print(f"Reward: {result.reward:.2f}")
-                print(obs.to_text())
+                print(f"[OK] Valid move | Reward: {result.reward:.2f}")
         else:
+            illegal_moves += 1
             if verbose:
-                print(f"Invalid action! Using random fallback.")
+                print(f"[X] Invalid action!")
+            
+            # Random fallback
             if obs.legal_actions:
-                import random
                 fallback = random.choice(obs.legal_actions)
                 action = ZipAction(fallback)
                 result = env.step(action)
                 move_history.append(f"({fallback})")
                 obs = result.observation
     
-    # Final result
-    won = result.info.get("win", False)
+    # Check win condition
+    won = result.done and obs.current_target > env.num_count
+    
     if verbose:
         print("\n" + "=" * 60)
         print(f"GAME OVER - {'WON!' if won else 'Lost'}")
+        print(f"Valid moves: {valid_moves}, Illegal: {illegal_moves}")
         print(f"Moves: {move_history}")
-        print(f"Solution was: {solution}")
         print("=" * 60)
     
-    return won, move_history
+    return won, valid_moves, illegal_moves
 
 
-if __name__ == "__main__":
-    # Path to trained model (use the latest one)
-    MODEL_PATH = "./zip_output/grpo-2026-01-30_19-21-26/final"
+def main():
+    parser = argparse.ArgumentParser(description="ZIP Game Inference")
+    parser.add_argument("--model-path", default="./zip_output/grpo-strategic-2026-01-31_13-47-18/final")
+    parser.add_argument("--base-model", default="Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("--board-size", type=int, default=6)
+    parser.add_argument("--num-count", type=int, default=8)
+    parser.add_argument("--num-games", type=int, default=10)
+    parser.add_argument("--max-turns", type=int, default=30)
+    parser.add_argument("--verbose", action="store_true", default=False)
+    args = parser.parse_args()
     
     # Load model
-    model, tokenizer = load_trained_model(MODEL_PATH)
+    model, tokenizer = load_trained_model(args.model_path, args.base_model)
     
-    # Create environment
-    env = ZipEnv(size=6, num_count=8)
-    
-    # Play a game
-    won, moves = play_game(model, tokenizer, env, max_turns=20, verbose=True)
-    
-    # Run multiple games for statistics
+    # Play one verbose game
     print("\n" + "=" * 60)
-    print("Running 10 games for statistics...")
+    print("Playing demo game...")
+    print("=" * 60)
+    env = ZipEnv(size=args.board_size, num_count=args.num_count)
+    play_game(model, tokenizer, env, max_turns=args.max_turns, verbose=True)
+    
+    # Run statistics
+    print("\n" + "=" * 60)
+    print(f"Running {args.num_games} games for statistics...")
     print("=" * 60)
     
     wins = 0
-    for i in range(10):
-        env_test = ZipEnv(size=6, num_count=8)
-        w, _ = play_game(model, tokenizer, env_test, max_turns=20, verbose=False)
-        if w:
-            wins += 1
-        print(f"Game {i+1}: {'Won' if w else 'Lost'}")
+    total_valid = 0
+    total_illegal = 0
     
-    print(f"\nWin rate: {wins}/10 ({wins*10}%)")
+    for i in range(args.num_games):
+        env = ZipEnv(size=args.board_size, num_count=args.num_count)
+        won, valid, illegal = play_game(model, tokenizer, env, max_turns=args.max_turns, verbose=args.verbose)
+        
+        if won:
+            wins += 1
+        total_valid += valid
+        total_illegal += illegal
+        print(f"Game {i+1}: {'Won' if won else 'Lost'} | Valid: {valid}, Illegal: {illegal}")
+    
+    print("\n" + "-" * 60)
+    print(f"Win rate: {wins}/{args.num_games} ({wins/args.num_games*100:.1f}%)")
+    print(f"Avg valid moves: {total_valid/args.num_games:.1f}")
+    print(f"Avg illegal moves: {total_illegal/args.num_games:.1f}")
+    print("-" * 60)
+
+
+if __name__ == "__main__":
+    main()

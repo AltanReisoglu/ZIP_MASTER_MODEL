@@ -1,7 +1,7 @@
 """
 ZIP Game Environment - OpenEnv Compatible
 
-TRL openenv ve OpenSpiel tarzında tasarlanmış RL ortamı.
+RL environment designed in TRL openenv and OpenSpiel style.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import numpy as np
 
 
 class ZipAction(BaseModel):
-    """ZIP oyunu aksiyonu"""
+    """ZIP game action"""
     direction: str  
     
     def __init__(self, direction: str = None, **data):
@@ -123,13 +123,13 @@ class ZipEnv:
         self.done = False
     
     def reset(self, seed: int = None) -> ZipResult:
-        """Yeni oyun başlat"""
+        """Start a new game"""
         if seed:
             self.rng = np.random.RandomState(seed)
         
         self._reset_state()
         
-        # Rastgele board oluştur
+        # Create random board
         positions = [(r, c) for r in range(self.size) for c in range(self.size)]
         self.rng.shuffle(positions)
         
@@ -149,7 +149,7 @@ class ZipEnv:
         )
     
     def step(self, action: ZipAction) -> ZipResult:
-        """Aksiyon uygula"""
+        """Apply action"""
         if self.done:
             return ZipResult(self._get_obs(), 0.0, True, {"error": "game_over"})
         
@@ -161,15 +161,15 @@ class ZipEnv:
         dr, dc = self.ACTIONS[direction]
         nr, nc = self.current_pos[0] + dr, self.current_pos[1] + dc
         
-        # Sınır kontrolü
+        # Boundary check
         if not (0 <= nr < self.size and 0 <= nc < self.size):
             return ZipResult(self._get_obs(), -0.1, False, {"error": "bounds"})
         
-        # Ziyaret kontrolü
+        # Visit check
         if (nr, nc) in self.visited:
             return ZipResult(self._get_obs(), -0.1, False, {"error": "visited"})
         
-        # Hareket
+        # Move
         self.current_pos = (nr, nc)
         self.visited.add(self.current_pos)
         
@@ -203,7 +203,7 @@ class ZipEnv:
         return ZipResult(self._get_obs(), reward, self.done, info)
     
     def _legal_actions(self) -> List[str]:
-        """Geçerli aksiyonlar"""
+        """Get valid actions"""
         legal = []
         r, c = self.current_pos
         for name, (dr, dc) in self.ACTIONS.items():
@@ -214,8 +214,8 @@ class ZipEnv:
         return legal
     
     def _get_obs(self) -> ZipObservation:
-        """Gözlem oluştur"""
-        # info_state: board'u flatten et (OpenSpiel uyumu için)
+        """Create observation"""
+        # info_state: flatten board (for OpenSpiel compatibility)
         info_state = self.board.flatten().astype(float).tolist()
         
         return ZipObservation(
