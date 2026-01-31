@@ -57,7 +57,7 @@ def generate_response(model, tokenizer, prompt: str, max_new_tokens: int = 256) 
         outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
-            temperature=0.7,
+            temperature=0.1,
             do_sample=True,
             pad_token_id=tokenizer.pad_token_id,
         )
